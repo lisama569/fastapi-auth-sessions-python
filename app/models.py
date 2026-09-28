@@ -72,9 +72,35 @@ class Resource:
     id: str
     owner_id: str
     kind: str = "doc"
+    title: str = ""
+
+
+@dataclass
+class Grant:
+    """资源协作授权：属主把某资源的某一项动作临时授予指定账号。
+
+    - action: 短动作名 read/update/delete（对应 resource:read 等策略动作）
+    - expires_at: 明确的失效时刻（epoch 秒）；判定时惰性检查，到点自动失效
+    - revoked: 撤销后立即对后续所有请求生效（判定每次回查服务端当前状态）
+    主键为 (resource_id, grantee_id, action)，重复授权即幂等更新该行。
+    """
+
+    resource_id: str
+    grantee_id: str
+    action: str
+    expires_at: float
+    granted_by: str
+    granted_at: float
+    revoked: bool = False
+    revoked_at: float | None = None
+
+    def is_active(self, now: float) -> bool:
+        return not self.revoked and self.expires_at > now
 
 
 @dataclass
 class Decision:
     allowed: bool
     reason: str
+    # 结构化放行来源：disabled / permission / role / owner / grant / deny
+    via: str = "deny"

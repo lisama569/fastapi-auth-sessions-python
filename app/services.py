@@ -16,6 +16,7 @@ from app.policy import decide
 from app.ratelimit import LoginRateLimiter
 from app.security import hash_password, redact, verify_password
 from app.store import Store
+from app import grants as grant_service
 from app.tokens import (
     issue_tokens,
     revoke_family_tree,
@@ -121,6 +122,69 @@ class AuthService:
     def authorize(self, user: User, action: str,
                   resource: Resource | None) -> Decision:
         return decide(user, action, resource)
+
+    # ---- 资源访问（读/改/删走同一套判定） ----
+    def check_resource(self, user: User, policy_action: str, resource_id: str,
+                       *, now: float | None = None) -> grant_service.AccessView:
+        """取资源 + 协作授权快照 + 策略判定，同一把锁内一次完成。
+
+        调用方对 resource is None 或 not allowed 一律按 404 处理。
+        """
+        return grant_service.authorize_resource(
+            self.store, user, policy_action, resource_id, now=now,
+        )
+
+    def update_resource(self, user: User, resource_id: str,
+                        title: str | None = None, kind: str | None = None,
+                        *, now: float | None = None) -> Resource:
+        view = self.check_resource(user, "resource:update", resource_id, now=now)
+        if view.resource is None or not view.decision.allowed:
+            from app.errors import AuthError, ErrorCode
+            raise AuthError(ErrorCode.NOT_FOUND)
+        resource = view.resource
+        # 仅凭协作授权放行的修改不得改变资源 kind，防止借 kind 切换到更宽松的
+        # 角色矩阵而提权；属主/管理员/显式权限的放行不受此限。
+        # 对外同样归一为 404，与"资源不存在/无权操作"完全同形，不泄露资源存在性。
+        if kind is not None and kind != resource.kind and view.decision.via == "grant":
+            from app.errors import AuthError, ErrorCode
+            raise AuthError(ErrorCode.NOT_FOUND)
+        if title is not None:
+            resource.title = title
+        if kind is not None:
+            resource.kind = kind
+        return resource
+
+    def delete_resource(self, user: User, resource_id: str,
+                        *, now: float | None = None) -> None:
+        view = self.check_resource(user, "resource:delete", resource_id, now=now)
+        if view.resource is None or not view.decision.allowed:
+            from app.errors import AuthError, ErrorCode
+            raise AuthError(ErrorCode.NOT_FOUND)
+        # 资源删除时连带清除其全部授权，避免悬挂授权
+        self.store.delete_resource(resource_id)
+
+    # ---- 资源协作授权 ----
+    def grant_resource_access(self, actor: User, resource_id: str,
+                              grantee_identity: str, action: str,
+                              expires_at: float,
+                              *, now: float | None = None):
+        return grant_service.grant_access(
+            self.store, self.settings, actor, resource_id,
+            grantee_identity, action, expires_at, now=now,
+        )
+
+    def revoke_resource_access(self, actor: User, resource_id: str,
+                               grantee_identity: str, action: str,
+                               *, now: float | None = None) -> None:
+        grant_service.revoke_access(
+            self.store, actor, resource_id, grantee_identity, action, now=now,
+        )
+
+    def list_resource_grants(self, actor: User, resource_id: str,
+                             *, now: float | None = None) -> list[dict]:
+        return grant_service.list_grants(
+            self.store, actor, resource_id, now=now,
+        )
 
     # ---- 权限即时变更 ----
     def change_role(self, actor: User, user_id: str, new_role: Role) -> User:

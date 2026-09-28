@@ -20,6 +20,8 @@ class ErrorCode(str, Enum):
     FORBIDDEN = "forbidden"                            # 已认证但无权限
     NOT_FOUND = "not_found"                            # 资源不存在（或无权查看时同样返回，避免差异暴露）
     RATE_LIMITED = "rate_limited"                      # 登录失败过多，处于退避锁定
+    INVALID_GRANT = "invalid_grant"                    # 授权请求非法（给自己授权/未知账号/失效时间非法）
+    GRANT_LIMIT_REACHED = "grant_limit_reached"        # 单资源有效授权条数超过上限
 
 
 class AuthError(Exception):
@@ -43,4 +45,6 @@ ERROR_STATUS: dict[ErrorCode, int] = {
     ErrorCode.FORBIDDEN: 403,
     ErrorCode.NOT_FOUND: 404,
     ErrorCode.RATE_LIMITED: 429,
+    ErrorCode.INVALID_GRANT: 422,
+    ErrorCode.GRANT_LIMIT_REACHED: 409,
 }

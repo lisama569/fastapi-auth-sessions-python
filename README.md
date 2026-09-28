@@ -96,18 +96,22 @@ curl -X POST http://127.0.0.1:8000/auth/logout \
    （写入 `User.extra_permissions`，变更在**下一次请求立即生效**）
 3. 资源无关动作命中角色矩阵 → 允许
 4. 资源相关动作：属主对自己资源可 `read/update/delete`
-5. 其余命中角色矩阵 → 允许
-6. 以上都不命中 → 默认拒绝
+5. 持有该资源该动作的**有效协作授权**（未撤销、未到期）→ 允许（见第三节）
+6. 其余命中角色矩阵（按资源 kind；仅 `doc` 适用下表） → 允许
+7. 以上都不命中 → 默认拒绝
 
-角色矩阵（可在 `policy.py` 中调整）：
+角色矩阵（可在 `policy.py` 中调整；仅适用于 `kind="doc"`，其它 kind
+默认不按角色放行，只认属主/admin/显式权限/协作授权）：
 
 | 动作 | admin | editor | viewer |
 |------|:-----:|:------:|:------:|
 | `resource:create`（无资源上下文） | ✓ | ✓ | ✗ |
-| `resource:read` | ✓ | ✓ | ✓ |
-| `resource:update`（非属主） | ✓ | ✓ | ✗ |
-| `resource:delete`（非属主） | ✓ | ✗ | ✗ |
+| `resource:read`（doc，非属主） | ✓ | ✓ | ✓ |
+| `resource:update`（doc，非属主） | ✓ | ✓ | ✗ |
+| `resource:delete`（doc，非属主） | ✓ | ✗ | ✗ |
 | `user:change_role` | ✓ | ✗ | ✗ |
+
+admin 对任意 kind 的资源始终拥有读/改/删与授权管理权。
 
 ### 权限 / 角色即时变更
 
@@ -119,10 +123,96 @@ curl -X POST http://127.0.0.1:8000/auth/logout \
 
 ### 防资源探测
 
-`GET /resources/{id}` 对“资源不存在”与“存在但无权访问”返回**同形的
-`404 not_found`**，未授权方无法据状态差异判断资源是否存在。
+`GET/PATCH/DELETE /resources/{id}` 对“资源不存在”与“存在但无权访问”返回
+**同形的 `404 not_found`**（状态码与响应体逐字一致），未授权方无法据状态差异
+判断资源是否存在。
 
-## 三、登录限流与退避
+## 三、资源协作授权（临时授权 / 到期 / 撤销）
+
+在角色与属主规则之上增加一层**资源级、账号级、动作级**的临时授权，编排位于
+`app/grants.py`，判定仍收敛在 `app/policy.py`，不另起一套规则。
+
+### 谁能授权
+
+只有以下三类主体能查看 / 新增 / 撤销某资源的授权（`can_manage_grants`）：
+
+1. 资源**属主**；
+2. **admin** 角色（对所有资源本来就具备完整管理权限）；
+3. 持有显式权限 `grant:manage:<kind>` / `grant:manage:*` / `*` 的账号。
+
+其他人（包括能读/改他人 `doc` 的 editor）访问授权接口得到的是与“资源不存在”
+**完全一致的 404**，既看不到也改不了。
+
+### 授权内容、有效期与撤销
+
+- 一项授权 = `(资源, 被授权账号, 动作)`；动作仅限 `read / update / delete`。
+- 必须指定明确的 `expires_at`（ISO 8601，建议带时区；不带时区按 UTC）：
+  - 必须晚于当前时间，否则 `422 invalid_grant`；
+  - 不得超过最长有效期（默认 30 天，`AUTH_GRANT_MAX_TTL`），否则同样 `422`。
+- **到期自动失效**：无后台任务，判定时按当前时间惰性检查，`expires_at`
+  时刻起立即失效。授权数据**不写入访问令牌**，因此到期与撤销都**不需要对方
+  重新登录**，下一次请求即按新状态判定。
+- **撤销即时生效**：撤销后被授权方手里已有的访问凭证对该资源动作立刻失效
+  （令牌本身仍可用于其它有权访问的资源，只有该授权被收回）。
+- 默认关口保持关闭：没有任何规则允许时一律拒绝，引入授权不会放宽默认口径。
+
+### 幂等与并发行为
+
+所有复合操作（取资源 → 管理权判定 → 查授权/计数 → 写入/访问判定）都在
+**同一把存储锁临界区**内完成：
+
+- 同一账号同一动作反复授权是**幂等**的：只更新同一行的 `expires_at`，
+  响应 `status` 分别为 `created` / `renewed`，不增加条数。
+- 并发对同一键新增/撤销：临界区串行化，**结束状态唯一确定**；撤销一旦提交
+  成功，之后取得锁的读/改/删请求不可能再被该授权放行。
+- 并发对不同账号新增：成功条数恰好等于上限，其余明确拒绝，绝不超额。
+- 撤销与资源删除撞上：两种交错都收敛，资源删除时连带清除全部授权，
+  不留下悬挂授权。
+
+### 授权上限
+
+单个资源的**有效授权条数**有明确上限（默认 **50**，`AUTH_GRANT_MAX_PER_RESOURCE`）。
+已过期与已撤销的授权不计入；对同一键续期不占新名额。超限时返回
+`409 grant_limit_reached`（响应中带 `limit`），撤销或到期释放名额后可再授予。
+
+### 与现有角色规则的兼容
+
+策略评估顺序为：禁用检查 → 显式权限 → 资源无关角色矩阵 → **属主** →
+**有效协作授权** → 资源角色矩阵 → 默认拒绝。既有角色矩阵对 `kind="doc"`
+保持原口径不变；对矩阵未覆盖的资源 kind（如 `sheet`），默认只有属主、
+admin、显式权限或被授权者可访问。
+
+### 接口
+
+| 方法/路径 | 说明 |
+|-----------|------|
+| `GET /resources/{id}` | 读取（同形 404 防探测） |
+| `PATCH /resources/{id}` | 修改 `title` / `kind`（与读取同一判定管线） |
+| `DELETE /resources/{id}` | 删除（连带清除授权；同形 404） |
+| `GET /resources/{id}/grants` | 查看授权列表（仅管理者；否则 404） |
+| `PUT /resources/{id}/grants` | 新增/续期授权，幂等，body：`grantee, action, expires_at` |
+| `POST /resources/{id}/grants/revoke` | 撤销授权，body：`grantee, action` |
+
+`grantee` 可传用户 id 或用户名；给属主自己授权返回 `422 invalid_grant`。
+撤销一个不存在/已撤销/已过期的授权返回 404（与不可见资源同口径，天然幂等）。
+
+> 仅凭协作授权获得的修改权**不能变更资源 `kind`**（防止把资源改到更宽松的
+> 角色矩阵上提权）；该类请求同样返回同形 404。属主与管理员改 kind 不受限。
+
+```bash
+# 属主 editor 临时授权 viewer 删除 doc-2，2 小时后失效
+EXP=$(python3 -c "from datetime import datetime,timezone,timedelta;\
+print((datetime.now(timezone.utc)+timedelta(hours=2)).isoformat())")
+curl -X PUT localhost:8000/resources/doc-2/grants \
+  -H "Authorization: Bearer $EDITOR_TOKEN" -H 'Content-Type: application/json' \
+  -d "{\"grantee\":\"viewer\",\"action\":\"delete\",\"expires_at\":\"$EXP\"}"
+# viewer 此刻即可删除（无需重新登录）；撤销则立刻失效
+curl -X POST localhost:8000/resources/doc-2/grants/revoke \
+  -H "Authorization: Bearer $EDITOR_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"grantee":"viewer","action":"delete"}'
+```
+
+## 四、登录限流与退避
 
 - 以 **(账号, 来源 IP)** 双维度计数，互不影响（见 `app/ratelimit.py`）。
 - 滑动窗口内失败达到阈值（默认 5 次 / 300 秒）→ 进入锁定，返回 `429 rate_limited`
@@ -131,7 +221,7 @@ curl -X POST http://127.0.0.1:8000/auth/logout \
   15s → 30s → 60s → 120s → …，封顶（默认 300s）。
 - 登录成功立即清零该维度计数。
 
-## 四、安全基线
+## 五、安全基线
 
 - 密码：PBKDF2-HMAC-SHA256（200k 轮）+ 每用户随机盐，恒定时间校验。
 - 敏感信息：密码与令牌**不写入日志**（日志仅记录用户标识摘要、令牌 id、错误码），
@@ -140,7 +230,7 @@ curl -X POST http://127.0.0.1:8000/auth/logout \
 - CORS：默认不放行任何来源；仅当显式配置来源时才启用中间件，凭证模式不使用通配来源。
 - 刷新令牌仅存哈希；重放即整族吊销。
 
-## 五、关键配置项（环境变量）
+## 六、关键配置项（环境变量）
 
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
@@ -157,8 +247,10 @@ curl -X POST http://127.0.0.1:8000/auth/logout \
 | `AUTH_LOGIN_BASE_LOCKOUT` | `15` | 首次锁定时长（秒），逐轮翻倍 |
 | `AUTH_LOGIN_MAX_LOCKOUT` | `300` | 退避封顶时长（秒） |
 | `AUTH_REVOKE_FAMILY_ON_REPLAY` | `true` | 重放时是否吊销整条刷新族 |
+| `AUTH_GRANT_MAX_PER_RESOURCE` | `50` | 单个资源的有效协作授权条数上限 |
+| `AUTH_GRANT_MAX_TTL` | `2592000` | 单次授权允许的最长有效期（秒，默认 30 天） |
 
-## 六、本地验证方法
+## 七、本地验证方法
 
 ```bash
 uv run pytest -s
@@ -174,6 +266,9 @@ uv run pytest -s
   **角色与显式权限变更即时生效**。
 - `tests/test_ratelimit.py`：阈值触发、双维度隔离、指数退避升级、成功清零、
   HTTP 429 与 `Retry-After`。
+- `tests/test_grants.py`：协作授权生效/幂等续期、**到期自动失效**、
+  **撤销后同一令牌立刻失效**、并发新增/撤销/删除的确定性、
+  越权与资源不存在同形 404、**超过单资源上限返回 409**、非属主不可管理授权。
 - `tests/test_http_integration.py`：Cookie 会话全链路、Header 与 Cookie 入口结果一致、
   CORS 默认不放行、响应不回显密码。
 
@@ -192,6 +287,17 @@ curl -s localhost:8000/resources/doc-1 -H "Authorization: Bearer $TOK"
 curl -i -X POST localhost:8000/resources -H "Authorization: Bearer $TOK" \
   -H 'Content-Type: application/json' -d '{"id":"x"}'
 # 4) 连续 5 次错误密码 -> 第 6 次 429 且带 Retry-After
+
+# 5) 协作授权：editor 授权 viewer 临时删除 doc-2（详见第三节）
+ETOK=$(curl -s -X POST localhost:8000/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"editor","password":"editor-pw"}' | jq -r .access_token)
+EXP=$(python3 -c "from datetime import datetime,timezone,timedelta;\
+print((datetime.now(timezone.utc)+timedelta(hours=2)).isoformat())")
+curl -s -X PUT localhost:8000/resources/doc-2/grants \
+  -H "Authorization: Bearer $ETOK" -H 'Content-Type: application/json' \
+  -d "{\"grantee\":\"viewer\",\"action\":\"delete\",\"expires_at\":\"$EXP\"}"
+curl -i -X DELETE localhost:8000/resources/doc-2 -H "Authorization: Bearer $TOK"
 ```
 
 ## 目录结构
@@ -204,7 +310,8 @@ app/security.py      密码哈希、随机令牌、HMAC、日志脱敏
 app/models.py        用户 / 会话 / 刷新记录 / 访问登记 / 资源 / 判定结果
 app/store.py         线程安全进程内存储
 app/tokens.py        令牌签发/校验/原子旋转/重放吊销
-app/policy.py        角色 + 资源属性 + 显式权限的默认拒绝策略
+app/policy.py        角色 + 资源属性 + 显式权限 + 协作授权的默认拒绝策略
+app/grants.py        资源协作授权：查看/新增/撤销/同锁访问判定、上限与并发编排
 app/ratelimit.py     (账号, IP) 维度失败计数与指数退避
 app/services.py      登录/注销/刷新/鉴权/角色变更编排、演示数据
 app/deps.py          Bearer/Cookie 统一取凭证依赖
