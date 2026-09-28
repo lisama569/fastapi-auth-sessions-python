@@ -95,19 +95,25 @@ curl -X POST http://127.0.0.1:8000/auth/logout \
 2. 显式权限命中 `action:kind` / `action:*` / `*` → 允许
    （写入 `User.extra_permissions`，变更在**下一次请求立即生效**）
 3. 资源无关动作命中角色矩阵 → 允许
-4. 资源相关动作：属主对自己资源可 `read/update/delete`
-5. 其余命中角色矩阵 → 允许
-6. 以上都不命中 → 默认拒绝
+4. 资源相关动作：属主对自己资源可 `read/update/delete/share`
+5. 当前有效的协作授权命中该动作 → 允许（详见第三章）
+6. 其余命中角色矩阵 → 允许
+7. 以上都不命中 → 默认拒绝
 
 角色矩阵（可在 `policy.py` 中调整）：
 
-| 动作 | admin | editor | viewer |
-|------|:-----:|:------:|:------:|
-| `resource:create`（无资源上下文） | ✓ | ✓ | ✗ |
-| `resource:read` | ✓ | ✓ | ✓ |
-| `resource:update`（非属主） | ✓ | ✓ | ✗ |
-| `resource:delete`（非属主） | ✓ | ✗ | ✗ |
-| `user:change_role` | ✓ | ✗ | ✗ |
+| 动作 | admin | editor | viewer | guest |
+|------|:-----:|:------:|:------:|:-----:|
+| `resource:create`（无资源上下文） | ✓ | ✓ | ✗ | ✗ |
+| `resource:read` | ✓ | ✓ | ✓ | ✗ |
+| `resource:update`（非属主） | ✓ | ✓ | ✗ | ✗ |
+| `resource:delete`（非属主） | ✓ | ✗ | ✗ | ✗ |
+| `resource:share`（管理协作授权） | ✓ | ✗ | ✗ | ✗ |
+| `user:change_role` | ✓ | ✗ | ✗ | ✗ |
+
+> `guest` 是无任何矩阵权限的演示角色：属主身份与协作授权之外一律默认拒绝。
+> 属主对自己的资源天然拥有 read/update/delete/share；协作授权只在矩阵之外
+> 增量放行 read/update/delete，详见第三章。
 
 ### 权限 / 角色即时变更
 
@@ -121,8 +127,113 @@ curl -X POST http://127.0.0.1:8000/auth/logout \
 
 `GET /resources/{id}` 对“资源不存在”与“存在但无权访问”返回**同形的
 `404 not_found`**，未授权方无法据状态差异判断资源是否存在。
+新增的 `PATCH/DELETE /resources/{id}` 以及全部授权端点遵守同一口径。
 
-## 三、登录限流与退避
+## 三、资源协作授权（临时授权）
+
+在角色/属主/显式权限之外增加一层**资源级临时授权**：属主可以把自己名下
+某个资源的部分动作（读/改/删）临时授予指定账号，带明确失效时间；到期或撤销
+即时生效，无需对方重新登录。判定仍收敛在 `app/policy.py`，默认关口不因引入
+授权而放开。
+
+### HTTP 接口
+
+| 方法/路径 | 作用 | 可调用方 |
+|-----------|------|-----------|
+| `GET /resources/{id}/grants` | 查看当前有效授权 | 属主 / admin 角色 / 显式 `resource:share` 权限 |
+| `PUT /resources/{id}/grants` | 新增或续期授权（幂等） | 同上 |
+| `POST /resources/{id}/grants/revoke` | 撤销授权（可只摘部分动作，幂等） | 同上 |
+| `PATCH /resources/{id}` | 修改资源（当前仅 `kind`） | 与读同一套判定：属主 / 角色 / 协作授权 |
+| `DELETE /resources/{id}` | 删除资源（级联清除其授权，204） | 同上 |
+
+授权请求体：
+
+```json
+{
+  "username": "friend",
+  "actions": ["read", "update"],
+  "expires_in": 3600
+}
+```
+
+- `actions` 只能取 `read / update / delete` 的**非空子集**（对应策略动作
+  `resource:read/resource:update/resource:delete`）；授权能力本身不可转授
+  （不能授 `share`）。非法动作返回 `422 invalid_grant`。
+- `expires_in` 为相对秒数，必须为正且不超过上限（默认 366 天，
+  可由 `AUTH_GRANT_MAX_TTL` 调整），否则 `422 invalid_grant`。
+- 撤销请求省略 `actions` 表示整条撤销；给出数组则只摘除其中动作，
+  最后一个动作被摘掉时整条标记为撤销。撤销不存在/已失效的授权仍返回 200（幂等）。
+
+### 谁能授权
+
+策略新增资源相关动作 `resource:share`（查看/新增/撤销授权都走它）：
+
+- **属主**对自己的资源天然可 share；
+- **admin 角色**可管理任意资源的授权（管理员本来就具备资源 update/delete 管理权）；
+- 其余角色（含 editor/viewer/guest）一律拒绝；显式权限 `resource:share:<kind>`
+  等也按现有显式权限规则生效。
+- 无权方调用任一授权端点，与访问不存在的资源返回**字节级一致的 `404 not_found`**，
+  无法借授权端点探测资源是否存在；给属主自己授权返回 `422 invalid_grant`。
+
+### 有效期、到期与撤销怎么算
+
+- 授权记录 `(resource_id, grantee_id)` 为唯一键，保存动作集合与绝对失效
+  时间戳 `expires_at`。
+- 每次资源请求都在**服务端实时比较** `expires_at` 与当前时间：到点即视为
+  不存在，下一次请求立刻被拒。访问令牌载荷不含授权快照，**对方无需重新登录，
+  也不会被强制刷新**，只是该动作不再被允许。
+- 撤销在存储锁内落盘后，对后续请求**立即生效**：对方手里已有的访问凭证
+  继续可用（登录态不受影响），但用它访问该资源对应动作时按未授权处理，
+  对无权方呈现与“资源不存在”一致的 404。
+- 同一账号同一资源反复 `PUT` 授权是**幂等**的：动作取并集，失效时间取更远者，
+  不新增条目、不重复占用名额。整条撤销/到期之后再次授权即恢复生效。
+
+### 并发行为
+
+所有授权写入（新增/撤销）与每次资源判定都在同一把进程内 `RLock` 临界区完成：
+
+- 资源判定在临界区内一次性取“资源 + 当前有效授权”快照后再决策，
+  因此**撤销成功返回之后，不会再有任何读/改/删请求被放行**，不存在
+  “撤销已 200、随后请求反而放行”的窗口；
+- 并发新增与撤销被锁串行化，最终状态确定（以实际落盘的最后一条写操作为准）；
+- 单资源授权计数也在同一临界区读取，不会超发。
+
+### 有效授权上限
+
+- 单个资源的有效授权按**不同被授权人**计数，默认上限 **50**
+  （`AUTH_GRANT_MAX_PER_RESOURCE` 可调）。达到上限后新被授权人得到
+  `409 grant_limit_exceeded`（响应体 `error.extra` 带 `limit/active`）；
+- 对同一被授权人续期/扩动作不新增计数；某条授权到期或撤销后名额自动释放；
+- 上限是**按资源独立**计数的，不影响属主对自己其他资源的授权。
+
+### 与现有角色规则如何兼容
+
+策略评估顺序（见 `app/policy.py`，命中即决定）：
+
+1. 用户禁用 → 拒绝
+2. 显式权限命中 `action:kind / action:* / *` → 允许
+3. 资源无关动作命中角色矩阵（如 `resource:create`）→ 允许
+4. **属主**对自己资源的 read/update/delete/**share** → 允许
+5. 当前有效**协作授权**命中该动作 → 允许
+6. 角色矩阵（editor 可改非己资源、admin 可删、viewer 可读等）→ 允许
+7. 全部不命中 → 默认拒绝
+
+协作授权只能在角色规则之外“加白名单”，永远不能让默认拒绝变宽松；
+新增的无矩阵权限角色 `guest` 用于演示“只有被明确授权才能访问”的账号。
+
+```bash
+# 属主 viewer 临时授权 friend 读/改 doc-1 一小时
+curl -X PUT localhost:8000/resources/doc-1/grants \
+  -H "Authorization: Bearer $OWNER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"username":"friend","actions":["read","update"],"expires_in":3600}'
+# friend 无需重新登录即可访问；属主随时查看/撤销
+curl localhost:8000/resources/doc-1/grants -H "Authorization: Bearer $OWNER_TOKEN"
+curl -X POST localhost:8000/resources/doc-1/grants/revoke \
+  -H "Authorization: Bearer $OWNER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"username":"friend"}'
+```
+
+## 四、登录限流与退避
 
 - 以 **(账号, 来源 IP)** 双维度计数，互不影响（见 `app/ratelimit.py`）。
 - 滑动窗口内失败达到阈值（默认 5 次 / 300 秒）→ 进入锁定，返回 `429 rate_limited`
@@ -131,7 +242,7 @@ curl -X POST http://127.0.0.1:8000/auth/logout \
   15s → 30s → 60s → 120s → …，封顶（默认 300s）。
 - 登录成功立即清零该维度计数。
 
-## 四、安全基线
+## 五、安全基线
 
 - 密码：PBKDF2-HMAC-SHA256（200k 轮）+ 每用户随机盐，恒定时间校验。
 - 敏感信息：密码与令牌**不写入日志**（日志仅记录用户标识摘要、令牌 id、错误码），
@@ -140,7 +251,7 @@ curl -X POST http://127.0.0.1:8000/auth/logout \
 - CORS：默认不放行任何来源；仅当显式配置来源时才启用中间件，凭证模式不使用通配来源。
 - 刷新令牌仅存哈希；重放即整族吊销。
 
-## 五、关键配置项（环境变量）
+## 六、关键配置项（环境变量）
 
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
@@ -157,8 +268,10 @@ curl -X POST http://127.0.0.1:8000/auth/logout \
 | `AUTH_LOGIN_BASE_LOCKOUT` | `15` | 首次锁定时长（秒），逐轮翻倍 |
 | `AUTH_LOGIN_MAX_LOCKOUT` | `300` | 退避封顶时长（秒） |
 | `AUTH_REVOKE_FAMILY_ON_REPLAY` | `true` | 重放时是否吊销整条刷新族 |
+| `AUTH_GRANT_MAX_PER_RESOURCE` | `50` | 单资源有效协作授权（按被授权人计数）上限 |
+| `AUTH_GRANT_MAX_TTL` | `31622400` | 单次协作授权最长有效期（秒，默认 366 天） |
 
-## 六、本地验证方法
+## 七、本地验证方法
 
 ```bash
 uv run pytest -s
@@ -176,6 +289,13 @@ uv run pytest -s
   HTTP 429 与 `Retry-After`。
 - `tests/test_http_integration.py`：Cookie 会话全链路、Header 与 Cookie 入口结果一致、
   CORS 默认不放行、响应不回显密码。
+- `tests/test_grants.py`：协作授权服务层——授权动作隔离、**到期自动失效（无需重登）**、
+  **撤销立即生效**、部分撤销、**幂等续期**、**单资源上限拒绝（409）**、
+  只有属主/admin 可管理、越权与不存在同形 404、非法入参 422、
+  **并发新增/撤销确定性**（12 线程 ×20 轮 + 撤销后 32 路并发读全部拒绝）。
+- `tests/test_grants_http.py`：HTTP 全链路——被授权 guest 授权前后可读/到期 404
+  且响应体与资源不存在**逐字节一致**、撤销后旧令牌立即被拒、PATCH/DELETE 与读同规则、
+  非属主探测授权端点同形 404、上限 409、非法载荷 422、撤销后 64 路并发读全 404。
 
 `-s` 会打印每个用例的 `[input] ... -> [decision] ...`，即输入与策略判定依据。
 
@@ -192,6 +312,8 @@ curl -s localhost:8000/resources/doc-1 -H "Authorization: Bearer $TOK"
 curl -i -X POST localhost:8000/resources -H "Authorization: Bearer $TOK" \
   -H 'Content-Type: application/json' -d '{"id":"x"}'
 # 4) 连续 5 次错误密码 -> 第 6 次 429 且带 Retry-After
+# 5) 协作授权：属主把 doc-1 的修改权临时授给别人，到期/撤销即失效
+#    （见“三、资源协作授权”小节完整示例）
 ```
 
 ## 目录结构
@@ -201,12 +323,12 @@ main.py              应用入口、CORS、统一错误处理（保持原启动�
 app/config.py        环境变量配置与安全默认值
 app/errors.py        稳定错误码 -> HTTP 状态映射（可区分拒绝原因）
 app/security.py      密码哈希、随机令牌、HMAC、日志脱敏
-app/models.py        用户 / 会话 / 刷新记录 / 访问登记 / 资源 / 判定结果
-app/store.py         线程安全进程内存储
+app/models.py        用户 / 会话 / 刷新记录 / 访问登记 / 资源 / 协作授权 / 判定结果
+app/store.py         线程安全进程内存储（含授权原子原语）
 app/tokens.py        令牌签发/校验/原子旋转/重放吊销
-app/policy.py        角色 + 资源属性 + 显式权限的默认拒绝策略
+app/policy.py        角色 + 资源属性 + 显式权限 + 协作授权的默认拒绝策略
 app/ratelimit.py     (账号, IP) 维度失败计数与指数退避
-app/services.py      登录/注销/刷新/鉴权/角色变更编排、演示数据
+app/services.py      登录/注销/刷新/鉴权/角色变更/协作授权编排、演示数据
 app/deps.py          Bearer/Cookie 统一取凭证依赖
 app/routes.py        HTTP 入口
 tests/               并发、重放、即时变更、限流退避等测试

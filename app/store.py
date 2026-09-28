@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import threading
 
-from app.models import AccessRecord, RefreshRecord, Resource, Session, User
+from app.models import AccessRecord, Grant, RefreshRecord, Resource, Session, User
 
 
 class Store:
@@ -21,6 +21,8 @@ class Store:
         self.refreshes: dict[str, RefreshRecord] = {}   # token_hash -> record
         self.families: dict[str, list[str]] = {}        # family_id -> [token_hash]
         self.resources: dict[str, Resource] = {}
+        # 协作授权：(resource_id, grantee_id) -> Grant
+        self.grants: dict[tuple[str, str], Grant] = {}
 
     # ---- 用户 ----
     def add_user(self, user: User) -> None:
@@ -113,6 +115,50 @@ class Store:
     def get_resource(self, resource_id: str) -> Resource | None:
         with self.lock:
             return self.resources.get(resource_id)
+
+    def delete_resource(self, resource_id: str) -> bool:
+        """删除资源并级联清除其全部协作授权（调用方须已通过判定）。"""
+        with self.lock:
+            existed = self.resources.pop(resource_id, None) is not None
+            dead = [k for k in self.grants if k[0] == resource_id]
+            for k in dead:
+                del self.grants[k]
+            return existed
+
+    # ---- 协作授权 ----
+    # 注意：以下方法只做锁内原语；"检查-判定-写入"的原子性由服务层
+    # 在同一把 store.lock 临界区内组合完成（与刷新旋转同一模式）。
+    def get_grant(self, resource_id: str, grantee_id: str) -> Grant | None:
+        with self.lock:
+            return self.grants.get((resource_id, grantee_id))
+
+    def active_grants_for(self, resource_id: str, now: float) -> list[Grant]:
+        """某资源当前有效（未撤销且未到期）的授权快照。"""
+        with self.lock:
+            return [
+                g for g in self.grants.values()
+                if g.resource_id == resource_id
+                and not g.revoked and g.expires_at > now
+            ]
+
+    def active_grant_count(self, resource_id: str, now: float) -> int:
+        with self.lock:
+            return sum(
+                1 for g in self.grants.values()
+                if g.resource_id == resource_id
+                and not g.revoked and g.expires_at > now
+            )
+
+    def put_grant(self, grant: Grant) -> None:
+        with self.lock:
+            self.grants[(grant.resource_id, grant.grantee_id)] = grant
+
+    def delete_grants_for_resource(self, resource_id: str) -> int:
+        with self.lock:
+            keys = [k for k in self.grants if k[0] == resource_id]
+            for k in keys:
+                del self.grants[k]
+            return len(keys)
 
 
 store = Store()

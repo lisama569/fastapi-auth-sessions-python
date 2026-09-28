@@ -10,6 +10,8 @@ class Role(str, Enum):
     ADMIN = "admin"
     EDITOR = "editor"
     VIEWER = "viewer"
+    # 无任何角色矩阵权限的普通账号：只能依赖属主身份或协作授权访问资源
+    GUEST = "guest"
 
 
 @dataclass
@@ -72,6 +74,24 @@ class Resource:
     id: str
     owner_id: str
     kind: str = "doc"
+
+
+@dataclass
+class Grant:
+    """资源协作授权：属主把自己资源的部分动作临时授予指定账号。
+
+    - actions: 被授权的资源动作集合（resource:read/update/delete）
+    - expires_at: 绝对失效时间戳；每次请求实时比较，到期自动失效，无需重登
+    - revoked: 撤销后立即失效；判定/撤销都在存储锁内完成，与读写互斥
+    """
+
+    resource_id: str
+    grantee_id: str
+    actions: set[str] = field(default_factory=set)
+    granted_at: float = 0.0
+    expires_at: float = 0.0
+    revoked: bool = False
+    revoked_at: float | None = None
 
 
 @dataclass

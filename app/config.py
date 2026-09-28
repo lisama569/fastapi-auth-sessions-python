@@ -58,6 +58,10 @@ class Settings:
     # 刷新重放是否吊销整条会话族（盗用检测）
     revoke_family_on_replay: bool = True
 
+    # 协作授权：单个资源的有效授权（不同被授权人）上限；单次授权最长有效期（秒）
+    grant_max_active_per_resource: int = 50
+    grant_max_ttl: int = 60 * 60 * 24 * 366
+
 
 def get_settings() -> Settings:
     """从环境变量构造 Settings，缺省值即安全基线。"""
@@ -75,4 +79,6 @@ def get_settings() -> Settings:
         login_base_lockout=_int_env("AUTH_LOGIN_BASE_LOCKOUT", 15),
         login_max_lockout=_int_env("AUTH_LOGIN_MAX_LOCKOUT", 300),
         revoke_family_on_replay=_bool_env("AUTH_REVOKE_FAMILY_ON_REPLAY", True),
+        grant_max_active_per_resource=_int_env("AUTH_GRANT_MAX_PER_RESOURCE", 50),
+        grant_max_ttl=_int_env("AUTH_GRANT_MAX_TTL", 60 * 60 * 24 * 366),
     )

@@ -31,7 +31,7 @@ if settings.cors_allow_origins:
         CORSMiddleware,
         allow_origins=list(settings.cors_allow_origins),
         allow_credentials=settings.cors_allow_credentials,
-        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type"],
     )
 
