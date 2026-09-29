@@ -98,3 +98,36 @@ def test_error_bodies_never_echo_password(client):
     r2 = c.post("/auth/login", json={"username": "x" * 10, "password": secret})
     assert secret not in r2.text
     print("\n[input] failed login payload -> [decision] response contains no secret")
+
+
+def test_replay_response_does_not_leak_internal_identifiers():
+    """刷新重放返回稳定错误码，但响应体不得包含 family_id 等内部标识。"""
+    store = Store()
+    seed_demo_data(store)
+    service = AuthService(store, Settings(login_max_failures=99))
+    main.app.state.service = service
+    main.app.state.store = store
+    with TestClient(main.app) as c:
+        # 登录后清掉自动携带的会话 Cookie，强制走 body 凭证，避免 Cookie 优先
+        r = c.post("/auth/login",
+                   json={"username": "viewer", "password": "viewer-pw"})
+        first_refresh = r.json()["refresh_token"]
+        c.cookies.clear()
+
+        # 第一次刷新成功（轮换）；响应会写回新一代 Cookie，重放前再次清掉，
+        # 确保 r2 用的是 body 里那份已经被轮换的旧凭证
+        r1 = c.post("/auth/refresh", json={"refresh_token": first_refresh})
+        assert r1.status_code == 200, r1.text
+        c.cookies.clear()
+
+        # 旧凭证重放：整族吊销，401 refresh_token_replay
+        r2 = c.post("/auth/refresh", json={"refresh_token": first_refresh})
+        assert r2.status_code == 401
+        body = r2.json()["error"]
+        assert body["code"] == "refresh_token_replay"
+        # 服务端内部携带的 family_id 不得透出；extra 中也不应出现内部字段
+        assert "family_id" not in body
+        assert "family_id" not in body.get("extra", {})
+        assert "session" not in str(body).lower()
+        print("\n[input] replay rotated refresh token over HTTP "
+              "-> [decision] 401 refresh_token_replay without internal ids")

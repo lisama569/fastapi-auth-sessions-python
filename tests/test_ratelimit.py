@@ -93,6 +93,9 @@ def test_http_rate_limit_response_has_retry_after():
         body = r.json()["error"]
         assert body["code"] == "rate_limited"
         assert int(r.headers["retry-after"]) > 0
+        # 对外安全的 extra 白名单字段随响应体透出
+        assert body["extra"]["retry_after"] == int(r.headers["retry-after"])
+        assert body["extra"]["backoff_count"] >= 1
         print(f"\n[input] 3 bad logins over HTTP "
               f"-> [decision] 429 rate_limited, "
               f"Retry-After={r.headers['retry-after']}")

@@ -185,25 +185,49 @@ curl -X POST http://127.0.0.1:8000/auth/logout \
 - 撤销在存储锁内落盘后，对后续请求**立即生效**：对方手里已有的访问凭证
   继续可用（登录态不受影响），但用它访问该资源对应动作时按未授权处理，
   对无权方呈现与“资源不存在”一致的 404。
-- 同一账号同一资源反复 `PUT` 授权是**幂等**的：动作取并集，失效时间取更远者，
-  不新增条目、不重复占用名额。整条撤销/到期之后再次授权即恢复生效。
+- 对同一账号重复 `PUT` 授权按该账号当前是否持有**有效**授权区分语义：
+  - **授权仍有效时再次 `PUT`（续期 / 扩动作）**：幂等原地更新同一条记录，
+    动作取并集、失效时间取更远者，不新增条目、不重复占用名额，永不受上限拦截。
+  - **授权已到期或已被整条撤销后再次 `PUT`（重新授权）**：等同一次**全新授权**，
+    动作与有效期完全以本次请求为准（不会与旧记录做并集、旧动作不会复活），
+    记录仍写回同一个 `(resource_id, grantee_id)` 键（因此条目不重复），
+    但必须按**新增一个有效名额**走同一套上限判断。
+- 部分撤销（只摘动作）后记录仍是有效授权：此时再 `PUT` 属于第一种“续期”，
+  动作在剩余动作上取并集；只有动作被摘空、整条标记撤销或到期后才是“重新授权”。
 
 ### 并发行为
 
-所有授权写入（新增/撤销）与每次资源判定都在同一把进程内 `RLock` 临界区完成：
+所有授权写入（新增/续期/重新授权/撤销）与每次资源判定都在同一把进程内
+`RLock` 临界区完成：
 
 - 资源判定在临界区内一次性取“资源 + 当前有效授权”快照后再决策，
   因此**撤销成功返回之后，不会再有任何读/改/删请求被放行**，不存在
   “撤销已 200、随后请求反而放行”的窗口；
-- 并发新增与撤销被锁串行化，最终状态确定（以实际落盘的最后一条写操作为准）；
-- 单资源授权计数也在同一临界区读取，不会超发。
+- 并发新增、重新授权与撤销被锁串行化，最终状态由实际落盘的最后一条写操作决定，
+  结果确定；但“先占名额再判断”不存在的窗口——计数与写入在同一临界区内完成；
+- **“数当前有效名额 → 比上限 → 写入新授权”在同一临界区内一次完成**，
+  因此并发新增/重新授权时，有且仅有不超过上限的请求成功，其余得到
+  `409 grant_limit_exceeded`；任何交错（含与撤销并发）都不会把有效授权数
+  顶到上限以上，也不会把名额空着时本应成功的一次授权误判成超限。
 
 ### 有效授权上限
 
-- 单个资源的有效授权按**不同被授权人**计数，默认上限 **50**
-  （`AUTH_GRANT_MAX_PER_RESOURCE` 可调）。达到上限后新被授权人得到
-  `409 grant_limit_exceeded`（响应体 `error.extra` 带 `limit/active`）；
-- 对同一被授权人续期/扩动作不新增计数；某条授权到期或撤销后名额自动释放；
+- 单个资源的有效授权按**不同被授权人**计数：一条授权记录
+  `(resource_id, grantee_id)` 在「未撤销 **且** `expires_at > 当前服务端时间`」
+  时恰好占 1 个名额，否则不占。默认上限 **50**
+  （`AUTH_GRANT_MAX_PER_RESOURCE` 可调）。达到上限后，无论是给**全新账号**
+  授权，还是给授权**已到期 / 已被整条撤销**的账号**重新授权**，都按同一口径
+  拒绝为 `409 grant_limit_exceeded`（响应体 `error.extra` 带
+  `{"limit":..,"active":..}`）——重新授权不会因该账号曾经持过名额而破例。
+- 唯一不受上限拦截的是**对当前仍有效授权的幂等续期 / 扩动作**（同一被授权人，
+  原地更新，不新增名额）。
+- **名额释放**：某条授权自然到期（下一次计数/判定时即不再计入，无需后台清理）
+  或被整条撤销后名额立即空出，可再授给任意账号（包括原来的被授权人，此时按
+  全新授权处理）。无论走“到期”还是“撤销”哪条路径，一次授权成功后该资源的
+  有效授权数都不会超过配置上限。
+- **被拒绝不留痕**：上限检查先于任何写入发生。达上限被拒的请求不会新建授权、
+  不会把已到期/已撤销的旧记录悄悄复活或改写其动作/有效期，也不会影响其它账号
+  的既有授权。
 - 上限是**按资源独立**计数的，不影响属主对自己其他资源的授权。
 
 ### 与现有角色规则如何兼容
@@ -292,10 +316,16 @@ uv run pytest -s
 - `tests/test_grants.py`：协作授权服务层——授权动作隔离、**到期自动失效（无需重登）**、
   **撤销立即生效**、部分撤销、**幂等续期**、**单资源上限拒绝（409）**、
   只有属主/admin 可管理、越权与不存在同形 404、非法入参 422、
-  **并发新增/撤销确定性**（12 线程 ×20 轮 + 撤销后 32 路并发读全部拒绝）。
+  **上限=1 时到期/撤销后重新授权仍被正确拦截（核心漏洞回归）**、
+  **被拒绝的重新授权不留痕且不改既有授权**、到期/撤销释放名额后复用、
+  **并发新增/重新授权/撤销确定性**（16 路抢名额恰好 cap 路成功；
+  撤销与两路重授并发全程不超 cap、不误拒；8 线程 ×30 轮混合压力
+  + 撤销后 32 路并发读全部拒绝）。
 - `tests/test_grants_http.py`：HTTP 全链路——被授权 guest 授权前后可读/到期 404
   且响应体与资源不存在**逐字节一致**、撤销后旧令牌立即被拒、PATCH/DELETE 与读同规则、
-  非属主探测授权端点同形 404、上限 409、非法载荷 422、撤销后 64 路并发读全 404。
+  非属主探测授权端点同形 404、上限 409（`error.extra` 带 limit/active）、
+  **已到期账号重新授权与全新账号同一上限口径**、非法载荷 422、
+  **8 路并发授权 + 10 轮混合授权/撤销后有效数恒不超上限**、撤销后 64 路并发读全 404。
 
 `-s` 会打印每个用例的 `[input] ... -> [decision] ...`，即输入与策略判定依据。
 
@@ -314,6 +344,37 @@ curl -i -X POST localhost:8000/resources -H "Authorization: Bearer $TOK" \
 # 4) 连续 5 次错误密码 -> 第 6 次 429 且带 Retry-After
 # 5) 协作授权：属主把 doc-1 的修改权临时授给别人，到期/撤销即失效
 #    （见“三、资源协作授权”小节完整示例）
+```
+
+单资源有效授权上限可以直接起一个小上限的服务端到端验证
+（下面把上限设成 1，复现“到期/撤销后重新授权也不能超发”）：
+
+```bash
+AUTH_GRANT_MAX_PER_RESOURCE=1 uv run fastapi dev main.py
+# 另开终端：属主 viewer 登录拿 OWNER_TOKEN（见上），并准备两个被授权账号
+TOK=$(curl -s -X POST localhost:8000/auth/login -H 'Content-Type: application/json' \
+  -d '{"username":"viewer","password":"viewer-pw"}' | jq -r .access_token)
+# editor/admin 是现成账号；这里用 editor 做 A、admin 做 B（仅用于演示计数）
+curl -i -X PUT localhost:8000/resources/doc-1/grants -H "Authorization: Bearer $TOK" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"editor","actions":["read"],"expires_in":1}'   # 200，A 占唯一名额
+sleep 1                                                          # 让 A 自然到期
+curl -i -X PUT localhost:8000/resources/doc-1/grants -H "Authorization: Bearer $TOK" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","actions":["read"],"expires_in":3600}' # 200，B 占满名额
+curl -i -X PUT localhost:8000/resources/doc-1/grants -H "Authorization: Bearer $TOK" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"editor","actions":["read"],"expires_in":3600}' # 409 grant_limit_exceeded
+# 409 响应体形如 {"error":{"code":"grant_limit_exceeded",
+#   "message":"...already has 1 active grants (limit 1)","extra":{"limit":1,"active":1}}}
+# 名额被 B 占着时，重新给已到期的 A 授权也被拒；先撤销 B 释放名额后 A 即可重新授权
+curl -s -X POST localhost:8000/resources/doc-1/grants/revoke -H "Authorization: Bearer $TOK" \
+  -H 'Content-Type: application/json' -d '{"username":"admin"}'
+curl -s -X PUT localhost:8000/resources/doc-1/grants -H "Authorization: Bearer $TOK" \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"editor","actions":["read"],"expires_in":3600}'   # 200，名额复用
+curl -s localhost:8000/resources/doc-1/grants -H "Authorization: Bearer $TOK"
+# -> grants 里只有 editor 一个有效被授权人
 ```
 
 ## 目录结构

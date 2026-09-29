@@ -190,10 +190,16 @@ class AuthService:
                now: float | None = None) -> Grant:
         """新增/续期协作授权（幂等）。
 
-        - 同一 (资源, 被授权人) 反复授权：动作集合并、有效期取更远者，
-          不新增授权条目、不重复计数。
+        - 同一 (资源, 被授权人) 当前授权仍有效时反复授权：动作集合并、
+          有效期取更远者，不新增授权条目、不重复计数，不受上限拦截。
+        - 新被授权人，以及对"已到期 / 已整条撤销"的账号重新授权：
+          一律视为占用一个新的有效名额，按同一个上限口径判断
+          （active_grant_count 只数未撤销且未到期的授权，旧的失效记录
+          不占名额）；达到上限明确抛出 GRANT_LIMIT_EXCEEDED。
         - "校验属主/管理权限 -> 校验参数 -> 计数上限 -> 写入"在同一把
-          存储锁内一次完成；与并发撤销/读改写互斥，结果确定。
+          存储锁内一次完成，上限检查先于任何写入，因此被拒绝时不会留下
+          新的有效授权，也不会改动任何既有授权；与并发撤销/读改写互斥，
+          有效授权数在任何串行化交错下都不会超过上限。
         """
         now = time.time() if now is None else now
         wanted = set(actions)
@@ -226,16 +232,25 @@ class AuthService:
 
             expires_at = now + expires_in
             existing = self.store.get_grant(resource_id, grantee.id)
-            if existing is not None and not existing.revoked \
-                    and existing.expires_at > now:
-                # 幂等续期：动作取并集，失效时间取更远者
+            is_active = (
+                existing is not None
+                and not existing.revoked
+                and existing.expires_at > now
+            )
+            if is_active:
+                # 幂等续期：同一被授权人的有效授权原地续期/扩动作，
+                # 不新增条目、不重复计数，永远不受上限拦截。
                 existing.actions |= wanted
                 existing.expires_at = max(existing.expires_at, expires_at)
                 grant = existing
             else:
-                # 新授权（含对已过期/已撤销项重新授权）先数上限
+                # 新被授权人，或该账号此前的授权已到期/已撤销后重新授权：
+                # 统一按"新增一个有效名额"处理，用同一个上限口径判断。
+                # active_grant_count 只数未撤销且未到期的记录，因此已失效的
+                # 旧记录本身不占名额；名额被其他人占满时重新授权必须明确拒绝。
+                # 检查在任何写入之前进行，被拒绝时旧记录与其它授权原样保留。
                 active = self.store.active_grant_count(resource_id, now)
-                if existing is None and active >= self.settings.grant_max_active_per_resource:
+                if active >= self.settings.grant_max_active_per_resource:
                     raise AuthError(
                         ErrorCode.GRANT_LIMIT_EXCEEDED,
                         f"resource {resource_id} already has {active} active grants "

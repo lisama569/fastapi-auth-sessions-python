@@ -49,6 +49,14 @@ async def auth_error_handler(request: Request, exc: AuthError) -> JSONResponse:
     status = ERROR_STATUS[exc.code]
     headers: dict[str, str] = {}
     detail = {"code": exc.code.value, "message": str(exc)}
+    # 业务附带信息仅透出对外安全的白名单字段（如上限的 limit/active、
+    # 限流的 retry_after）；内部标识（如刷新族 family_id）不外泄。
+    public_extra = {
+        k: v for k, v in exc.extra.items()
+        if k in {"limit", "active", "retry_after", "backoff_count"}
+    }
+    if public_extra:
+        detail["extra"] = public_extra
     if exc.code is ErrorCode.RATE_LIMITED:
         retry = exc.extra.get("retry_after")
         if retry:
