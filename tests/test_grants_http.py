@@ -184,6 +184,122 @@ def test_invalid_grant_payloads_are_rejected(client):
     assert r.status_code == 422
 
 
+def test_regrant_expired_and_revoked_at_cap_rejected_http(client):
+    """HTTP：上限已满时，对已到期/已撤销账号重新授权同样 409，且不产生新有效授权。"""
+    c, service = client
+    owner_h = {"Authorization": f"Bearer {_token(c, 'owner', 'owner-pw')}"}
+    service.store.add_user(User(
+        id="u_a3", username="alice",
+        password_hash=hash_password("x"), role=Role.GUEST))
+    service.store.add_user(User(
+        id="u_b3", username="bob",
+        password_hash=hash_password("x"), role=Role.GUEST))
+
+    # friend 先拿一条 60s 授权，再把到期时间拨到过去模拟自然到期（不占名额）
+    r = c.put("/resources/res-1/grants", headers=owner_h, json={
+        "username": "friend", "actions": ["read"], "expires_in": 60})
+    assert r.status_code == 200
+    service.store.get_grant("res-1", "u_friend").expires_at = time.time() - 1
+
+    # alice / bob 占满 cap=2
+    for name in ("alice", "bob"):
+        r = c.put("/resources/res-1/grants", headers=owner_h, json={
+            "username": name, "actions": ["read"], "expires_in": 600})
+        assert r.status_code == 200
+
+    # 对已到期的 friend 重新授权 -> 409，错误体带 limit/active
+    r = c.put("/resources/res-1/grants", headers=owner_h, json={
+        "username": "friend", "actions": ["read"], "expires_in": 600})
+    assert r.status_code == 409
+    body = r.json()
+    assert body["error"]["code"] == "grant_limit_exceeded"
+    assert body["error"]["extra"] == {"limit": 2, "active": 2}
+    # 被拒绝后有效授权仍是 alice/bob，friend 的旧记录仍处于到期状态
+    active = {g["username"] for g in
+              c.get("/resources/res-1/grants", headers=owner_h).json()["grants"]}
+    assert active == {"alice", "bob"}
+
+    # 撤销 alice 释放名额后：alice（已撤销）重新授权可以成功（名额由她空出）
+    assert c.post("/resources/res-1/grants/revoke", headers=owner_h,
+                   json={"username": "alice"}).status_code == 200
+    r = c.put("/resources/res-1/grants", headers=owner_h, json={
+        "username": "alice", "actions": ["update"], "expires_in": 600})
+    assert r.status_code == 200 and r.json()["actions"] == ["update"]
+    # 再次占满：已撤销语义不变——friend（仍到期）重新授权依旧 409
+    r = c.put("/resources/res-1/grants", headers=owner_h, json={
+        "username": "friend", "actions": ["read"], "expires_in": 600})
+    assert r.status_code == 409
+    active = {g["username"] for g in
+              c.get("/resources/res-1/grants", headers=owner_h).json()["grants"]}
+    assert active == {"alice", "bob"}
+    print("\n[input] http regrant expired friend at cap=2 -> 409; "
+          "revoked alice reuses her freed slot; friend still 409")
+
+
+def test_concurrent_revoke_and_grants_hold_cap_http(client):
+    """HTTP 并发：撤销 friend 释放 1 个名额，随后 3 路授权同时抢。
+
+    释放 1 个名额时 3 路并发（friend 重新授权 + 2 个新账号），恰好 1 路成功、
+    其余 409；最终有效授权恰好为 cap=2；未参与竞争的既有授权不受任何影响。
+    用裸 threading.Thread + join（与并发读测试同模式）：join 返回前每个
+    HTTP 请求都已执行完毕，不会有残留线程跨越 fixture 边界污染后续用例。
+    """
+    import threading
+
+    c, service = client
+    owner_h = {"Authorization": f"Bearer {_token(c, 'owner', 'owner-pw')}"}
+    service.store.add_user(User(
+        id="u_m1", username="m1",
+        password_hash=hash_password("x"), role=Role.GUEST))
+    service.store.add_user(User(
+        id="u_m2", username="m2",
+        password_hash=hash_password("x"), role=Role.GUEST))
+    service.store.add_user(User(
+        id="u_m3", username="m3",
+        password_hash=hash_password("x"), role=Role.GUEST))
+
+    # 占满 cap=2：friend + m1
+    r = c.put("/resources/res-1/grants", headers=owner_h, json={
+        "username": "friend", "actions": ["read"], "expires_in": 600})
+    assert r.status_code == 200
+    r = c.put("/resources/res-1/grants", headers=owner_h, json={
+        "username": "m1", "actions": ["read"], "expires_in": 600})
+    assert r.status_code == 200
+
+    gate = threading.Event()
+    statuses: list[int] = []
+    slock = threading.Lock()
+    candidates = ["friend", "m2", "m3"]
+
+    def grantee_loop(name: str) -> None:
+        assert gate.wait(5.0)
+        r = c.put("/resources/res-1/grants", headers=owner_h, json={
+            "username": name, "actions": ["read"], "expires_in": 600})
+        assert r.status_code in (200, 409), r.text
+        with slock:
+            statuses.append(r.status_code)
+
+    threads = [threading.Thread(target=grantee_loop, args=(n,))
+               for n in candidates]
+    for t in threads: t.start()
+    # 先撤销 friend 释放唯一空名额，再开闸让 3 路同时抢
+    r = c.post("/resources/res-1/grants/revoke",
+                headers=owner_h, json={"username": "friend"})
+    assert r.status_code == 200
+    gate.set()
+    for t in threads: t.join()
+
+    # 1 个空名额：恰好 1 路 200，2 路 409；最终有效授权恰好为 cap=2
+    assert statuses.count(200) == 1
+    assert statuses.count(409) == 2
+    active = service.store.active_grants_for("res-1", time.time())
+    assert len(active) == 2
+    grantee_ids = {g.grantee_id for g in active}
+    assert "u_m1" in grantee_ids  # 未参与竞争的既有授权不受影响
+    print(f"\n[input] revoke friend then 3 concurrent grants for 1 slot "
+          f"-> [decision] statuses={sorted(statuses)}, cap held at 2")
+
+
 def test_revoke_racing_concurrent_reads_is_deterministic(client):
     """撤销成功返回之后的所有读请求必须全部 404，不存在放行窗口。"""
     import concurrent.futures

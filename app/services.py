@@ -188,12 +188,21 @@ class AuthService:
     def grant(self, actor: User, resource_id: str, grantee_name: str,
                actions: list[str], expires_in: int,
                now: float | None = None) -> Grant:
-        """新增/续期协作授权（幂等）。
+        """新增/续期协作授权（PUT 幂等）。
 
-        - 同一 (资源, 被授权人) 反复授权：动作集合并、有效期取更远者，
-          不新增授权条目、不重复计数。
-        - "校验属主/管理权限 -> 校验参数 -> 计数上限 -> 写入"在同一把
-          存储锁内一次完成；与并发撤销/读改写互斥，结果确定。
+        分三种情况，名额口径完全一致（有效授权数按不同被授权人计数）：
+
+        - 同一 (资源, 被授权人) 的授权仍有效：动作取并集、有效期取更远者，
+          不新增授权条目、不重复计数，达到上限也允许（不会把计数顶到上限以上）；
+        - 该 (资源, 被授权人) 有历史记录但已到期或已撤销：按一次全新授权
+          重新占用名额，动作与有效期以本次请求为准（不继承旧状态），
+          必须通过与全新账号相同的上限检查；
+        - 从未授权过的新被授权人：同样先通过上限检查再写入。
+
+        "校验属主/管理权限 -> 校验参数 -> 计数上限 -> 写入"在同一把
+        存储锁内一次完成；上限检查在任何字段改动之前，因此达到上限被
+        拒绝时不会写入新记录，也不会改动既有授权的动作/有效期/撤销状态；
+        与并发撤销/读改写互斥，有效授权数不可能超过配置上限。
         """
         now = time.time() if now is None else now
         wanted = set(actions)
@@ -228,14 +237,19 @@ class AuthService:
             existing = self.store.get_grant(resource_id, grantee.id)
             if existing is not None and not existing.revoked \
                     and existing.expires_at > now:
-                # 幂等续期：动作取并集，失效时间取更远者
+                # 幂等续期：动作取并集，失效时间取更远者。
+                # 该 (资源, 被授权人) 名额已计入 active 计数，不新增计数，
+                # 因此即使当前已达上限也允许（永远不会把计数顶到上限以上）。
                 existing.actions |= wanted
                 existing.expires_at = max(existing.expires_at, expires_at)
                 grant = existing
             else:
-                # 新授权（含对已过期/已撤销项重新授权）先数上限
+                # 新授权（无历史记录）与对已到期/已撤销记录的重新授权，
+                # 按同一个口径占用名额：先在锁内数当前有效授权，达到上限
+                # 立即拒绝。计数之后、拒绝之前不做任何写入或字段改动，
+                # 因此被拒绝时不会新增有效授权，也不会改动既有授权范围。
                 active = self.store.active_grant_count(resource_id, now)
-                if existing is None and active >= self.settings.grant_max_active_per_resource:
+                if active >= self.settings.grant_max_active_per_resource:
                     raise AuthError(
                         ErrorCode.GRANT_LIMIT_EXCEEDED,
                         f"resource {resource_id} already has {active} active grants "
@@ -243,6 +257,8 @@ class AuthService:
                         extra={"limit": self.settings.grant_max_active_per_resource,
                                 "active": active},
                     )
+                # 重新授权语义：旧记录已失效（到期/撤销），本次授权按新的
+                # 动作集合与有效期重新生效，不继承旧的撤销状态与有效期。
                 grant = Grant(
                     resource_id=resource_id, grantee_id=grantee.id,
                     actions=set(wanted), granted_at=now, expires_at=expires_at,

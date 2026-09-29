@@ -53,6 +53,9 @@ async def auth_error_handler(request: Request, exc: AuthError) -> JSONResponse:
         retry = exc.extra.get("retry_after")
         if retry:
             headers["Retry-After"] = str(retry)
+    elif exc.extra:
+        # 如 grant_limit_exceeded 附带 {limit, active}，供调用方区分口径
+        detail["extra"] = exc.extra
     logger.warning(
         "auth reject path=%s code=%s status=%d",
         request.url.path, exc.code.value, status,
